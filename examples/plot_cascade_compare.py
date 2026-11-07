@@ -128,6 +128,25 @@ def _validate_architecture(algorithm, run):
     if algorithm == 'happo' and requested:
         raise ValueError('HAPPO comparison requires independent actor parameters')
     architecture = run.get('actor_architecture')
+    objective = run.get('learning_objective')
+    critic_dim = 6  # Historical runs used individual mixed values plus legacy.
+    if objective is not None:
+        if not isinstance(objective, dict):
+            raise ValueError('learning_objective must be a mapping')
+        team = algorithm == 'happo' and objective.get('advantage_source') == 'shared_team'
+        expected_objective = dict(
+            advantage_source='shared_team' if team else 'individual_mixed',
+            reward_formula=('0.5 * sum(local rewards) + 0.5 * global generation reward'
+                            if team else '0.5 * own local reward + 0.5 * global generation reward'),
+            critic_reward_layout='shared_team' if team else 'mixed_by_reservoir_then_legacy_team',
+            actor_value_channels=[0]*5 if team else list(range(5)),
+            normalization=('once_over_common_rollout_rows' if team
+                           else 'per_reservoir_over_common_rollout_rows'
+                           if settings.get('algo', {}).get('normalize_shared_advantages', False)
+                           else 'per_reservoir_over_controllable_rows'))
+        if objective != expected_objective:
+            raise ValueError('Learning objective does not match the algorithm reward/value layout')
+        critic_dim = 1 if team else 6
     if architecture is None:
         if requested:
             raise ValueError('Shared MAPPO requires explicit actor_architecture metadata')
@@ -143,7 +162,7 @@ def _validate_architecture(algorithm, run):
     expected = dict(network_count=1 if shared else 5, optimizer_count=1 if shared else 5,
         raw_observation_dim=raw_dim, network_observation_dim=raw_dim+5 if shared else raw_dim,
         identity_features='one_hot_reservoir_id' if shared else 'implicit_in_separate_actor',
-        critic_output_dim=6)
+        critic_output_dim=critic_dim)
     if any(architecture.get(key) != value for key, value in expected.items()):
         raise ValueError('Actor architecture dimensions/counts do not match the cascade observations')
 
@@ -221,6 +240,8 @@ def load_comparison(happo_log=None, mappo_log=None):
         if recorded is not None and str(recorded).lower() != algorithm:
             raise ValueError('The supplied '+algorithm+' log records a different algorithm')
         run['comparison_context'] = context_from_configuration(metadata)
+        if 'learning_objective' in metadata:
+            run['learning_objective'] = metadata['learning_objective']
         if 'actor_architecture' in metadata:
             run['actor_architecture'] = copy.deepcopy(metadata['actor_architecture'])
         runs.append(dict(algorithm=algorithm, payload=run))
@@ -295,11 +316,11 @@ def make_figures(payload):
             _periodic(ax, algorithm, run, term+'_violation_rate', percent=True)
     shared = payload['runs'][0]['payload']['comparison_context']['shared_settings']
     for ax, label in zip(training_axes, (
-            'Mean collected episode net return (gamma={:g})'.format(float(shared['gamma'])),
+            'Mean collected legacy-team return (gamma={:g})'.format(float(shared['gamma'])),
             'Mean collected episode generation (TWh)')):
         ax.set(xlabel='Collected daily environment transitions', ylabel=label,
                title='{}-day stochastic training episodes (in-sample)'.format(shared['episode_horizon_days']))
-    evaluator_ax.set(ylabel='Evaluator return (mean of three fixed training windows)',
+    evaluator_ax.set(ylabel='Legacy-team return (mean of three fixed training windows)',
                      title='Evaluator Return vs. Evaluation Round')
     for ax, title in zip(violation_axes, ('Ecological-flow violation rate', 'Guaranteed-output violation rate')):
         ax.set(ylabel='Violation rate (%)', title=title)
@@ -312,6 +333,13 @@ def make_figures(payload):
         if handles:
             ax.legend(handles, labels, fontsize=8)
     violations.suptitle('Fixed-scenario evaluation: violation rates')
+    objectives = {entry['algorithm']: entry['payload'].get('learning_objective', {}).get('advantage_source', 'individual_mixed')
+                  for entry in payload['runs']}
+    if len(set(objectives.values())) > 1:
+        note = 'Different learning objectives: HAPPO shared team; MAPPO individual mixed'
+        training.suptitle(note, fontsize=10)
+        evaluator.suptitle(note, fontsize=10)
+        violations.suptitle('Fixed-scenario violation rates\n'+note, fontsize=10)
     return dict(training=training, evaluator=evaluator, violations=violations)
 
 

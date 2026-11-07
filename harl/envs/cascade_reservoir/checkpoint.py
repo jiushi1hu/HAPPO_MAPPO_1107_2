@@ -19,7 +19,8 @@ from harl.envs.cascade_reservoir.data_loader import CascadeData, IDS
 from harl.envs.cascade_reservoir.episodes import episode_environment, positive_integer
 from harl.envs.cascade_reservoir.evaluation import DailyLimitMetrics, _attach_evaluation_progress
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
-from harl.envs.cascade_reservoir.reward import EpisodeRewardMetrics, reward_metadata, validate_discount_factor
+from harl.envs.cascade_reservoir.reward import (
+    EpisodeRewardMetrics, SYSTEM_REWARD_DEFINITION, reward_metadata, validate_discount_factor)
 from harl.models.policy_models.stochastic_policy import StochasticPolicy
 from harl.models.value_function_models.v_net import VNet
 
@@ -41,7 +42,11 @@ REPLAY_TRACE_FIELDS = (
     'mixed_reward', 'system_reward', 'legacy_team_reward',
     'guaranteed_output_shortfall_MW', 'ecological_flow_shortfall_m3s',
     'guaranteed_output_shortfall_MWh', 'ecological_flow_deficit_m3',
-    'value', 'next_value', 'td_residual', 'realized_mixed_reward_to_go',
+    'critic_reward_layout', 'value_channel', 'value_basis', 'learning_reward',
+    'value', 'next_value', 'td_residual', 'realized_learning_reward_to_go',
+    'replay_gae_target', 'replay_gae_advantage',
+    'shared_team_value', 'next_shared_team_value', 'shared_team_td_residual',
+    'realized_shared_team_reward_to_go', 'realized_mixed_reward_to_go',
     'legacy_team_value', 'realized_legacy_team_reward_to_go',
 )
 
@@ -103,6 +108,40 @@ def _state_hash(state):
     return digest.hexdigest()
 
 
+def _critic_layout(metadata):
+    """Validate value-head meaning separately from actor parameter sharing.
+
+    Earlier six-head files predate explicit layout metadata. Their five mixed
+    heads and final legacy head retain that interpretation, including historical
+    HAPPO files; they are never reinterpreted as the new scalar team critic.
+    """
+    dimension = metadata['critic_output_dim']
+    if isinstance(dimension, (bool, np.bool_)) or not isinstance(dimension, (int, np.integer)):
+        raise ValueError('Checkpoint critic output dimension must be an integer')
+    explicit = 'critic_reward_layout' in metadata or 'actor_value_channels' in metadata
+    if not explicit:
+        if dimension != len(IDS)+1:
+            raise ValueError('Scalar team checkpoints require explicit critic reward layout and actor channels')
+        return 'mixed_by_reservoir_then_legacy_team', tuple(range(len(IDS))), int(dimension)
+    layout = metadata.get('critic_reward_layout')
+    channels = metadata.get('actor_value_channels')
+    if (not isinstance(channels, (list, tuple)) or len(channels) != len(IDS) or
+            any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
+                for value in channels)):
+        raise ValueError('Checkpoint actor value channels must identify five integer heads')
+    if layout == 'shared_team':
+        expected_dimension, expected_channels, algorithm = 1, (0,)*len(IDS), 'happo'
+    elif layout == 'mixed_by_reservoir_then_legacy_team':
+        expected_dimension, expected_channels, algorithm = len(IDS)+1, tuple(range(len(IDS))), 'mappo'
+    else:
+        raise ValueError('Unsupported checkpoint critic reward layout')
+    if dimension != expected_dimension or tuple(channels) != expected_channels:
+        raise ValueError('Checkpoint critic reward layout, dimensions and actor channels disagree')
+    if metadata.get('algorithm_name', 'happo') != algorithm:
+        raise ValueError('Checkpoint algorithm disagrees with its critic reward layout')
+    return layout, expected_channels, expected_dimension
+
+
 def save_checkpoint(runner, path):
     """Exclusively save the completed policy, without changing runner or RNG state."""
     path = Path(path)
@@ -110,8 +149,12 @@ def save_checkpoint(runner, path):
         raise FileExistsError('Checkpoint already exists: '+str(path))
     if runner.update_count < 1:
         raise ValueError('A checkpoint requires a completed policy update')
-    if len(runner.actor) != len(IDS) or runner.critic_output_dim != len(IDS)+1:
-        raise ValueError('Checkpoint requires five actors and a six-output critic')
+    if len(runner.actor) != len(IDS):
+        raise ValueError('Checkpoint requires five actors')
+    layout_metadata = dict(algorithm_name=getattr(runner, 'algorithm_name', 'happo'),
+        critic_output_dim=runner.critic_output_dim, critic_reward_layout=runner.critic_reward_layout,
+        actor_value_channels=list(runner.actor_value_channels))
+    _critic_layout(layout_metadata)
     shared_actor = runner.algo_args['algo'].get('share_param', False)
     if not isinstance(shared_actor, bool):
         raise ValueError('Actor parameter sharing must be a boolean')
@@ -141,7 +184,7 @@ def save_checkpoint(runner, path):
     metadata = _plain(dict(seed=runner.seed, policy_update=runner.update_count,
         policy_episode=runner.completed_episodes, training_steps=runner.training_steps,
         episode_horizon_days=runner.length, action_bins=runner.action_bins,
-        reservoir_ids=list(IDS), critic_output_dim=runner.critic_output_dim,
+        reservoir_ids=list(IDS), **layout_metadata,
         observation=runner.envs[0].observation_metadata(), settings=settings,
         settings_sha256=_digest(settings), data_root=runner.data.root,
         data_hashes=data_hashes, source_hashes=_source_hashes(),
@@ -153,10 +196,6 @@ def save_checkpoint(runner, path):
             value_normalizer=None if normalizer_state is None else _state_hash(normalizer_state)),
         purpose='deterministic evaluation replay; training resume is not implemented',
         torch_version=str(torch.__version__), numpy_version=str(np.__version__)))
-    # Older HAPPO checkpoints keep their existing metadata schema. MAPPO uses
-    # the same inference network but records its distinct training provenance.
-    if getattr(runner, 'algorithm_name', 'happo') == 'mappo':
-        metadata['algorithm_name'] = 'mappo'
     if shared_actor:
         metadata.update(actor_parameter_sharing=True, agent_ids=list(range(len(IDS))),
                         actor_observation_dim=actor_dim, raw_actor_observation_dim=raw_dim)
@@ -225,8 +264,9 @@ def load_checkpoint(path, data_root=None):
             raise ValueError('Checkpoint effective settings hash mismatch')
         if metadata['source_hashes'] != _source_hashes():
             raise ValueError('Checkpoint implementation source/config hash mismatch')
-        if metadata['reservoir_ids'] != list(IDS) or metadata['critic_output_dim'] != 6:
-            raise ValueError('Checkpoint requires five actors and six critic outputs')
+        if metadata['reservoir_ids'] != list(IDS):
+            raise ValueError('Checkpoint reservoir IDs disagree with the five-reservoir cascade')
+        _, _, critic_output_dim = _critic_layout(metadata)
         shared_actor = metadata.get('actor_parameter_sharing', False)
         if not isinstance(shared_actor, bool):
             raise ValueError('Checkpoint actor parameter sharing must be a boolean')
@@ -274,7 +314,7 @@ def load_checkpoint(path, data_root=None):
             if (metadata.get('raw_actor_observation_dim') != raw_dim or
                     metadata.get('actor_observation_dim') != actor_dim):
                 raise ValueError('Shared checkpoint actor observation dimensions disagree with agent IDs')
-        network_args = {**args['model'], **args['algo'], 'critic_output_dim': 6}
+        network_args = {**args['model'], **args['algo'], 'critic_output_dim': critic_output_dim}
         # Initializers consume RNG, so reconstruction must restore its caller's
         # state even on a malformed model state/load failure.
         with torch.random.fork_rng(devices=[]):
@@ -294,7 +334,7 @@ def load_checkpoint(path, data_root=None):
             critic.requires_grad_(False).eval()
             normalizer = None
             if payload['value_normalizer'] is not None:
-                normalizer = ValueNorm(6)
+                normalizer = ValueNorm(critic_output_dim)
                 normalizer.load_state_dict(payload['value_normalizer'], strict=True)
                 normalizer.requires_grad_(False).eval()
     except (KeyError, TypeError, RuntimeError) as exc:
@@ -335,12 +375,18 @@ class FrozenCascadePolicy:
         self.episode_days = metadata['episode_horizon_days']
         self.action_bins = metadata['action_bins']
         self.gamma = metadata['settings']['algorithm']['algo']['gamma']
+        self.gae_lambda = validate_discount_factor(metadata['settings']['algorithm']['algo']['gae_lambda'])
+        self.critic_reward_layout, self.actor_value_channels, self.critic_output_dim = _critic_layout(metadata)
 
     def _values(self, state):
         values = self.critic(state[None]).cpu().numpy()
         if self.value_normalizer is not None:
             values = self.value_normalizer.denormalize(values)
-        return values[0].copy()
+        # Preserve the network's float32 predictions, then promote diagnostic
+        # arithmetic so vector GAE and the serialized scalar TD rows agree.
+        # NumPy otherwise multiplies float32 arrays by gamma in float32 while
+        # the corresponding scalar expression is promoted to float64.
+        return values[0].astype(np.float64, copy=True)
 
     @torch.no_grad()
     def replay(self, source_years, episode_days=None, writer=None, action_overrides=None):
@@ -369,7 +415,8 @@ class FrozenCascadePolicy:
         env = episode_environment(self.data, self.physical_config, years, days, self.action_bins)
         initial = env.storage.copy()
         limits, metrics = DailyLimitMetrics(env), EpisodeRewardMetrics(self.gamma)
-        rows, rewards = [], []
+        rows, rewards, value_history, next_value_history = [], [], [], []
+        mixed_rewards, team_rewards, legacy_rewards = [], [], []
         energy, spill, residual = 0., 0., 0.
         energy_by, spill_by = np.zeros(5), np.zeros(5)
         for step in range(1, days+1):
@@ -388,7 +435,7 @@ class FrozenCascadePolicy:
                 _attach_evaluation_progress(exc, env, metrics, energy)
                 raise
             transition = env.last_transition
-            next_values = np.zeros(6) if step == days else self._values(env.state())
+            next_values = np.zeros(self.critic_output_dim) if step == days else self._values(env.state())
             metrics.update(transition)
             limits.update()
             energy += float(transition['energy'].sum())
@@ -396,8 +443,18 @@ class FrozenCascadePolicy:
             energy_by += transition['energy']
             spill_by += transition['spill']*env.physics.dt
             residual = max(residual, float(np.abs(transition['residual']).max()))
-            rewards.append(np.r_[transition['mixed_rewards'], transition['reward']])
+            team = self.critic_reward_layout == 'shared_team'
+            rewards.append(np.asarray([transition['system_reward']]) if team else
+                           np.r_[transition['mixed_rewards'], transition['reward']])
+            value_history.append(values)
+            next_value_history.append(next_values)
+            mixed_rewards.append(np.asarray(transition['mixed_rewards']).copy())
+            team_rewards.append(float(transition['system_reward']))
+            legacy_rewards.append(float(transition['reward']))
             for i, name in enumerate(IDS):
+                channel = self.actor_value_channels[i]
+                learning_reward = rewards[-1][channel]
+                td = float(learning_reward+self.gamma*next_values[channel]-values[channel])
                 distribution = distributions[i]
                 shortfalls = transition.get('service_shortfalls')
                 integrals = transition.get('service_shortfall_integrals')
@@ -416,10 +473,17 @@ class FrozenCascadePolicy:
                     local_reward_penalty=float(transition['local_reward_penalties'][i]),
                     local_reward=float(transition['local_rewards'][i]), global_reward=float(transition['global_reward']),
                     mixed_reward=float(transition['mixed_rewards'][i]), system_reward=float(transition['system_reward']),
-                    legacy_team_reward=float(transition['reward']), value=float(values[i]),
-                    next_value=float(next_values[i]),
-                    td_residual=float(transition['mixed_rewards'][i]+self.gamma*next_values[i]-values[i]),
-                    legacy_team_value=float(values[-1]), realized_mixed_reward_to_go=0.,
+                    legacy_team_reward=float(transition['reward']),
+                    critic_reward_layout=self.critic_reward_layout, value_channel=channel,
+                    value_basis='shared_team_system_reward' if team else 'own_mixed_reward',
+                    learning_reward=float(learning_reward), value=float(values[channel]),
+                    next_value=float(next_values[channel]), td_residual=td,
+                    realized_learning_reward_to_go=0., replay_gae_target=0., replay_gae_advantage=0.,
+                    shared_team_value=float(values[0]) if team else None,
+                    next_shared_team_value=float(next_values[0]) if team else None,
+                    shared_team_td_residual=td if team else None,
+                    realized_shared_team_reward_to_go=0.,
+                    legacy_team_value=None if team else float(values[-1]), realized_mixed_reward_to_go=0.,
                     realized_legacy_team_reward_to_go=0.,
                     guaranteed_output_shortfall_MW=None if shortfalls is None else float(shortfalls['guaranteed_output'][i]),
                     ecological_flow_shortfall_m3s=None if shortfalls is None else float(shortfalls['ecological_flow'][i]),
@@ -437,12 +501,24 @@ class FrozenCascadePolicy:
                     row[field] = float(transition[source][i])
                 row['spill_volume_m3'] = float(transition['spill'][i]*env.physics.dt)
                 rows.append(row)
-        remaining = np.zeros(6)
+        remaining = np.zeros(self.critic_output_dim)
+        remaining_mixed, remaining_team, remaining_legacy = np.zeros(len(IDS)), 0., 0.
+        replay_gae = np.zeros(self.critic_output_dim)
         for t in reversed(range(days)):
             remaining = rewards[t]+self.gamma*remaining
+            remaining_mixed = mixed_rewards[t]+self.gamma*remaining_mixed
+            remaining_team = team_rewards[t]+self.gamma*remaining_team
+            remaining_legacy = legacy_rewards[t]+self.gamma*remaining_legacy
+            delta = rewards[t]+self.gamma*next_value_history[t]-value_history[t]
+            replay_gae = delta+self.gamma*self.gae_lambda*replay_gae
             for i in range(5):
-                rows[5*t+i]['realized_mixed_reward_to_go'] = float(remaining[i])
-                rows[5*t+i]['realized_legacy_team_reward_to_go'] = float(remaining[-1])
+                row, channel = rows[5*t+i], self.actor_value_channels[i]
+                row['realized_learning_reward_to_go'] = float(remaining[channel])
+                row['replay_gae_advantage'] = float(replay_gae[channel])
+                row['replay_gae_target'] = float(replay_gae[channel]+value_history[t][channel])
+                row['realized_shared_team_reward_to_go'] = float(remaining_team)
+                row['realized_mixed_reward_to_go'] = float(remaining_mixed[i])
+                row['realized_legacy_team_reward_to_go'] = float(remaining_legacy)
         feasible = limits.finish()
         if writer is not None:
             for row in rows:
@@ -452,10 +528,20 @@ class FrozenCascadePolicy:
         used_years = list(dict.fromkeys(d.year for d in env.data.dates))
         totals = metrics.summary(detailed=True)
         totals.update(reward_metadata(self.data))
+        totals['mixed_reward_definition'] = totals['actor_reward_definition']
+        team = self.critic_reward_layout == 'shared_team'
+        if team:
+            totals['actor_reward_definition'] = SYSTEM_REWARD_DEFINITION
+        totals['advantage_source'] = 'shared_team' if team else 'individual_mixed'
+        totals['advantage_normalization'] = ('once_over_common_rollout_rows' if team else
+            'per_reservoir_over_common_rollout_rows' if self.metadata['settings']['algorithm']['algo'].get(
+                'normalize_shared_advantages', False) else 'per_reservoir_over_controllable_rows')
         return dict(status='ok', phase=phase, seed=self.metadata['seed'],
             policy_update=self.metadata['policy_update'], policy_episode=self.metadata['policy_episode'],
             training_steps=self.metadata['training_steps'], source_years=used_years,
             episode_horizon_days=days, completed_steps=days,
+            critic_reward_layout=self.critic_reward_layout, critic_output_dim=self.critic_output_dim,
+            actor_value_channels=list(self.actor_value_channels),
             start_date=env.data.dates[0].isoformat(), end_date=env.data.dates[-1].isoformat(),
             energy_MWh=energy, energy_TWh=energy/1e6, spill_volume_m3=spill,
             energy_by_reservoir_TWh=(energy_by/1e6).tolist(),
@@ -468,4 +554,6 @@ class FrozenCascadePolicy:
             action_overrides=[dict(episode_step=int(step), reservoir=name, action_index=int(index))
                               for (step, name), index in sorted(overrides.items())],
             trace_rows=len(rows), value_interpretation='saved frozen critic in reward units; '
-                'realized reward-to-go is observational and does not reconstruct training advantages')
+                'value_basis and value_channel identify the actual training reward; '
+                'mixed/system/legacy Monte Carlo accounting is independent of critic heads; '
+                'replay GAE uses this evaluation trajectory and does not reconstruct training advantages')

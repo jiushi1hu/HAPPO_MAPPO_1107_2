@@ -17,7 +17,9 @@ from harl.envs.cascade_reservoir.evaluation import evaluate_policy
 from harl.envs.cascade_reservoir.periodic_evaluation import (
     evaluate_periodic_policy, select_periodic_windows)
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
-from harl.envs.cascade_reservoir.reward import EpisodeRewardMetrics, reward_settings, validate_discount_factor
+from harl.envs.cascade_reservoir.reward import (
+    ACTOR_REWARD_DEFINITION, SYSTEM_REWARD_DEFINITION, EpisodeRewardMetrics,
+    reward_settings, validate_discount_factor)
 from harl.envs.cascade_reservoir.training_metrics import log_episode, log_step, step_record
 from harl.envs.cascade_reservoir.training_sampler import TrainingWindowSampler, validate_sampling_mode
 from harl.runners.on_policy_ha_runner import OnPolicyHARunner
@@ -51,6 +53,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
     actor_class = HAPPO
     algorithm_name = 'happo'
     share_actor_parameters = False
+    critic_reward_layout = 'shared_team'
+    actor_value_channels = (0, 0, 0, 0, 0)
 
     def __init__(self, data, physical_config, algo_args, seed, episode_log=None, step_log=None,
                  periodic_windows=None, training_sampler=None, xld_log=None,
@@ -105,9 +109,18 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
         torch.use_deterministic_algorithms(True)
         self.reward_settings = reward_settings(physical_config)
-        # One centralized critic: five individual mixed returns and one legacy
-        # team-return output reserved for the existing accounting diagnostics.
-        self.critic_output_dim = self.num_agents + 1
+        # HAPPO uses one team-return value. The MAPPO subclass retains its
+        # five mixed-return values and legacy accounting-value output.
+        if self.critic_reward_layout == 'shared_team':
+            self.critic_output_dim = 1
+            expected_channels = (0,) * self.num_agents
+        elif self.critic_reward_layout == 'mixed_by_reservoir_then_legacy_team':
+            self.critic_output_dim = self.num_agents + 1
+            expected_channels = tuple(range(self.num_agents))
+        else:
+            raise ValueError('Unsupported critic reward layout')
+        if tuple(self.actor_value_channels) != expected_channels:
+            raise ValueError('Actor value channels disagree with the critic reward layout')
         self.value_normalizer = ValueNorm(self.critic_output_dim, device=self.device) if args['train']['use_valuenorm'] else None
         self.envs = [episode_environment(data, physical_config,
             self.windows[self.training_window_starts[0]], self.length, self.action_bins)]
@@ -149,6 +162,43 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         """Keep the original five independent HAPPO networks by default."""
         return [self.actor_class(network_args, env.observation_space[i],
                 env.action_space[i], self.device) for i in range(self.num_agents)]
+
+    def _critic_rewards(self, transitions):
+        """Select learning rewards without changing physical/accounting rewards."""
+        if self.critic_reward_layout == 'shared_team':
+            # system_reward counts the global component once, unlike summing
+            # the five individual mixed rewards.
+            return np.asarray([[row['system_reward']] for row in transitions], dtype=np.float32)
+        return np.asarray([np.r_[row['mixed_rewards'], row['reward']]
+                           for row in transitions], dtype=np.float32)
+
+    def _learning_reward_metadata(self):
+        """Describe the actual policy target alongside preserved accounting fields."""
+        team = self.critic_reward_layout == 'shared_team'
+        common_rows = self.algo_args['algo'].get('normalize_shared_advantages', False)
+        return dict(algorithm=self.algorithm_name,
+            critic_reward_layout=self.critic_reward_layout,
+            actor_value_channels=list(self.actor_value_channels),
+            advantage_source='shared_team' if team else 'individual_mixed',
+            actor_reward_sources=(['system_reward']*len(self.actor_value_channels) if team else
+                                  ['mixed_rewards[{}]'.format(i) for i in self.actor_value_channels]),
+            advantage_estimator='gae' if self.algo_args['algo'].get('use_gae', True) else 'discounted_return',
+            advantage_normalization=('once_over_common_rollout_rows' if team else
+                'per_reservoir_over_common_rollout_rows' if common_rows else
+                'per_reservoir_over_controllable_rows'),
+            actor_reward_definition=SYSTEM_REWARD_DEFINITION if team else ACTOR_REWARD_DEFINITION,
+            mixed_reward_definition=ACTOR_REWARD_DEFINITION)
+
+    def _annotate_learning_rewards(self, record):
+        """Add provenance to one runtime record and its learning/window summaries."""
+        metadata = self._learning_reward_metadata()
+        record.update(metadata)
+        if isinstance(record.get('learning_rewards'), dict):
+            record['learning_rewards'].update(metadata)
+        for window in record.get('windows', ()):
+            if isinstance(window, dict):
+                self._annotate_learning_rewards(window)
+        return record
 
     def _make_training_sampler(self, episodes):
         return TrainingWindowSampler(self.data, self.length, episodes, self.n_envs,
@@ -242,8 +292,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     b.insert(obs[:, i], effective_actions[:, i:i+1], lp, next_masks,
                              np.ones((self.n_envs, 1), dtype=np.float32))
                     b.active_masks[t] = controls[:, i:i+1]
-                cb.insert(state, _t2n(values),
-                    np.asarray([np.r_[r['mixed_rewards'], r['reward']] for r in transitions], dtype=np.float32),
+                cb.insert(state, _t2n(values), self._critic_rewards(transitions),
                     next_masks, np.ones_like(next_masks))
                 forced += int((controls == 0).sum())
                 largest_residual = max(largest_residual,
@@ -254,6 +303,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 self.hard_failed_episodes += 1
                 record.update(failed_episodes_so_far=self.hard_failed_episodes,
                     hard_constraint_failure_rate_so_far=self.hard_failed_episodes/self.episode_attempts)
+                self._annotate_learning_rewards(record)
                 log_episode(record, self.episode_log)
             log_episode(dict(record_type='training_sampling_aborted', seed=self.seed,
                 attempted_window_starts=years, cause=str(exc),
@@ -271,6 +321,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 episodes_per_update=self.n_envs, collecting_for_update=self.update_count+1,
                 policy_updates_completed=self.update_count, training_steps=self.collected_training_steps,
                 ppo_epochs_max=self.requested_args['algo']['ppo_epoch'])
+            self._annotate_learning_rewards(record)
             self.episode_history.append(record)
             log_episode(record, self.episode_log)
             metrics.append(result['reward_metrics'])
@@ -289,7 +340,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         predictions = cb.value_preds[:-1]
         if self.value_normalizer is not None:
             predictions = self.value_normalizer.denormalize(predictions)
-        # Retain the meaning of the original team-value fit summaries.
+        # The last value is HAPPO's scalar team return, or MAPPO's retained
+        # legacy accounting return. Generic fit fields follow that layout.
         predictions = predictions[..., -1:]
         targets = cb.returns[:-1, :, -1:]
         self.last_rollout.update(gae_target_mean=float(targets.mean()),
@@ -391,6 +443,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             windows=self.periodic_windows, gamma=self.algo_args['algo']['gamma'],
             xld_log=self.xld_log if self.update_count == self.training_sampler.updates else None,
             xld_diagnostics=self.xld_diagnostics_enabled and self.update_count == self.training_sampler.updates)
+        self._annotate_learning_rewards(record)
         self.periodic_evaluation_history.append(record)
         log_episode(record, self.episode_log)
         return record
@@ -415,7 +468,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     evaluation_round=self.update_count, window_id='held_out_sequence')
         except InfeasibleCascade as exc:
             progress = getattr(exc, 'evaluation_progress', {})
-            log_episode(dict(record_type='final_evaluation_sequence', phase='evaluation',
+            log_episode(self._annotate_learning_rewards(dict(record_type='final_evaluation_sequence', phase='evaluation',
                 seed=self.seed, episode=self.completed_episodes, training_steps=self.training_steps,
                 evaluation_source_years=years, episode_horizon_days=self.length,
                 status='failed', feasible=False, gamma=self.algo_args['algo']['gamma'],
@@ -425,7 +478,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     completed_steps=progress.get('completed_steps', 0)),
                 partial_metrics=progress.get('partial_metrics', {}),
                 partial_xld_dispatch_diagnostics=progress.get('xld_dispatch_diagnostics'),
-                episode_reward=None, energy_MWh=None, energy_TWh=None, **metadata), self.episode_log)
+                episode_reward=None, energy_MWh=None, energy_TWh=None, **metadata)), self.episode_log)
             raise  # Preserve the existing final-evaluation stop-on-failure behavior.
         finally:
             for actor,mode in zip(self.actor,modes):
@@ -433,5 +486,6 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         row.update(record_type='final_evaluation_sequence',**metadata,
                    source_year_labels=[label for year,label in zip(years,self.data.evaluation_labels)
                                        if year in row['source_years']])
+        self._annotate_learning_rewards(row)
         log_episode(row,self.episode_log)
         return [row]

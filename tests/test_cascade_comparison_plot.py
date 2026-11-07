@@ -79,10 +79,39 @@ def payload():
                                             dict(algorithm='mappo', payload=run(100))])
 
 
+def use_current_learning_objectives(data):
+    """Declare the user-selected HAPPO-only team objective explicitly."""
+    for entry in data['runs']:
+        team = entry['algorithm'] == 'happo'
+        common_rows = entry['payload']['comparison_context']['shared_settings']['algo'].get(
+            'normalize_shared_advantages', False)
+        entry['payload']['learning_objective'] = dict(
+            advantage_source='shared_team' if team else 'individual_mixed',
+            reward_formula=('0.5 * sum(local rewards) + 0.5 * global generation reward'
+                            if team else '0.5 * own local reward + 0.5 * global generation reward'),
+            critic_reward_layout='shared_team' if team else 'mixed_by_reservoir_then_legacy_team',
+            actor_value_channels=[0]*5 if team else list(range(5)),
+            normalization=('once_over_common_rollout_rows' if team
+                           else 'per_reservoir_over_common_rollout_rows' if common_rows
+                           else 'per_reservoir_over_controllable_rows'))
+        entry['payload']['actor_architecture'] = dict(parameter_sharing=False,
+            network_count=5, optimizer_count=5, raw_observation_dim=15,
+            network_observation_dim=15, identity_features='implicit_in_separate_actor',
+            critic_output_dim=1 if team else 6)
+    return data
+
+
 @unittest.skipIf(plt is None, 'Matplotlib is available in the plotting interpreter')
 class ComparisonFigureTest(unittest.TestCase):
     def tearDown(self):
         plt.close('all')
+
+    def test_current_objectives_are_labeled_without_changing_physical_metric_curves(self):
+        figures = compare.make_figures(use_current_learning_objectives(payload()))
+        for figure in figures.values():
+            self.assertIn('Different learning objectives', figure._suptitle.get_text())
+        np.testing.assert_allclose(figures['training'].axes[0].lines[0].get_ydata(), [3.5, 5.5])
+        np.testing.assert_allclose(figures['violations'].axes[1].lines[1].get_ydata(), [15., 15., 15.])
 
     def test_joint_figures_keep_seeds_within_algorithm(self):
         figures = compare.make_figures(payload())
@@ -169,6 +198,32 @@ def write_log(path, algorithm, inline_context, labeled=True):
 
 
 class ComparisonIdentityTest(unittest.TestCase):
+    def test_team_objective_requires_scalar_happo_value_and_single_global_term(self):
+        data = use_current_learning_objectives(payload())
+        compare.validate_comparison(data)
+        for flag in (False, True):
+            changed = payload()
+            for entry in changed['runs']:
+                entry['payload']['comparison_context']['shared_settings']['algo'][
+                    'normalize_shared_advantages'] = flag
+            use_current_learning_objectives(changed)
+            compare.validate_comparison(changed)
+            self.assertEqual(changed['runs'][0]['payload']['learning_objective']['normalization'],
+                             'once_over_common_rollout_rows')
+            self.assertEqual(changed['runs'][1]['payload']['learning_objective']['normalization'],
+                             'per_reservoir_over_common_rollout_rows' if flag else
+                             'per_reservoir_over_controllable_rows')
+        for field, value in (('actor_value_channels', list(range(5))),
+                             ('reward_formula', 'sum(mixed rewards)'),
+                             ('normalization', 'per_actor_controllable_rows')):
+            changed = copy.deepcopy(data)
+            changed['runs'][0]['payload']['learning_objective'][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'Learning objective'):
+                compare.validate_comparison(changed)
+        data['runs'][0]['payload']['actor_architecture']['critic_output_dim'] = 6
+        with self.assertRaisesRegex(ValueError, 'architecture'):
+            compare.validate_comparison(data)
+
     def test_shared_mappo_architecture_is_the_only_allowed_settings_exception(self):
         data = payload()
         happo, mappo = [entry['payload'] for entry in data['runs']]

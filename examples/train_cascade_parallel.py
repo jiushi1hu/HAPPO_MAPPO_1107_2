@@ -179,12 +179,24 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
     # Keep every other optimization, physical and budget setting comparable.
     shared_algo.pop('share_param',None)
     sharing=bool(getattr(runner_cls,'share_actor_parameters',False))
+    critic_layout=getattr(runner_cls,'critic_reward_layout','mixed_by_reservoir_then_legacy_team')
+    team_advantage=critic_layout=='shared_team'
+    learning_objective=dict(
+        advantage_source='shared_team' if team_advantage else 'individual_mixed',
+        reward_formula=('0.5 * sum(local rewards) + 0.5 * global generation reward'
+                        if team_advantage else '0.5 * own local reward + 0.5 * global generation reward'),
+        critic_reward_layout=critic_layout,
+        actor_value_channels=[0]*5 if team_advantage else list(range(5)),
+        normalization=('once_over_common_rollout_rows' if team_advantage
+                       else 'per_reservoir_over_common_rollout_rows'
+                       if config['algo'].get('normalize_shared_advantages',False)
+                       else 'per_reservoir_over_controllable_rows'))
     raw_observation_dim=len(actor_observation_features(physical.get('use_daily_level_limits',False)))
     actor_architecture=dict(parameter_sharing=sharing,network_count=1 if sharing else 5,
         optimizer_count=1 if sharing else 5,raw_observation_dim=raw_observation_dim,
         network_observation_dim=raw_observation_dim+(5 if sharing else 0),
         identity_features='one_hot_reservoir_id' if sharing else 'implicit_in_separate_actor',
-        critic_output_dim=6)
+        critic_output_dim=1 if team_advantage else 6)
     comparison_context=json.loads(json.dumps(dict(shared_settings=dict(
         episode_horizon_days=days,parallel_environments=count,episodes_per_seed=episodes,
         gamma=config['algo']['gamma'],action_bins=bins,seeds=config['experiment']['seeds'],
@@ -281,6 +293,15 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
         source_code_hashes={str(path.relative_to(ROOT)):hashlib.sha256(path.read_bytes()).hexdigest() for path in sources})
     metadata['comparison_context']=comparison_context
     metadata['actor_architecture']=actor_architecture
+    metadata['learning_objective']=learning_objective
+    if team_advantage:
+        metadata['learning_reward_architecture'].update(
+            actor_reward=learning_objective['reward_formula'],
+            critic='one centralized scalar value for the shared team return',
+            actor_advantages='one team-reward GAE normalized once over common rollout rows and shared by all five actors',
+            update_interpretation='sequential HAPPO clipped surrogates use one shared team advantage; '
+                'the global reward is counted once in the team reward')
+        metadata['trajectory_diagnostics']['advantages']='shared team reward/value channel 0; normalized once over common rollout rows; actor-entry HAPPO factor remains separate'
     if algorithm_name is not None:
         metadata['algorithm']=algorithm_name
     if algorithm_name=='mappo':
@@ -333,7 +354,8 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             training_sampling_coverage_per_seed=[runner.training_coverage_summary() for runner in runners],
             final_policy_metadata=[runner.evaluation_policy_metadata() for runner in runners],
             policy_checkpoints=[checkpoint for runner in runners for checkpoint in runner.checkpoint_history],
-            evaluation_skipped=bool(args.skip_final_evaluation),evaluations=evaluations)
+            evaluation_skipped=bool(args.skip_final_evaluation),evaluations=evaluations,
+            learning_objective=learning_objective)
         if xld_summary is not None:
             result['xld_dispatch_summary']=xld_summary
         log_episode(result,stream)
@@ -343,7 +365,7 @@ def run_parallel_experiment(data,physical,config,args,*,runner_cls=CascadeReserv
             histories=[runner.training_history for runner in runners],
             evaluation_histories=[runner.periodic_evaluation_history for runner in runners],
             algorithm=algorithm_name or 'happo',comparison_context=comparison_context,
-            actor_architecture=actor_architecture),allow_nan=False))
+            actor_architecture=actor_architecture,learning_objective=learning_objective),allow_nan=False))
         if xld_summary is not None:
             payload['xld_dispatch_summary']=xld_summary
         if not args.no_plot:

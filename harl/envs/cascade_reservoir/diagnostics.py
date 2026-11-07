@@ -101,10 +101,14 @@ def before_update(runner):
 @torch.no_grad()
 def after_update(runner, before):
     cb = runner.critic_buffer
-    # The last output is the retained legacy team return. Actor-specific
-    # learning diagnostics below use the first five outputs independently.
-    mc_start = float(before['mc'][0,:,-1].mean())
-    prediction_start = float(before['prediction'][0,:,-1].mean())
+    from harl.envs.cascade_reservoir.learning_signal import critic_reward_spec, learning_signal_report
+    spec = critic_reward_spec(runner, cb.rewards.shape[-1])
+    fitted = slice(spec['fit_channel'], spec['fit_channel']+1)
+    mc_start = float(before['mc'][0,:,spec['fit_channel']].mean())
+    prediction_start = float(before['prediction'][0,:,spec['fit_channel']].mean())
+    if spec['shared_team'] and 'episode_reward' not in runner.last_reward_metrics:
+        raise ValueError('Shared-team diagnostics require separate legacy episode accounting')
+    accounting_reward = float(runner.last_reward_metrics.get('episode_reward', mc_start))
     prediction = runner.critic.get_values(
         cb.share_obs[:-1].reshape(-1, cb.share_obs.shape[-1]))
     prediction = prediction.cpu().numpy().reshape(cb.rewards.shape)
@@ -117,21 +121,24 @@ def after_update(runner, before):
         window_starts=list(runner.batch_window_starts),
         source_years=[list(years) for years in runner.batch_source_years],
         episode_horizon_days=cb.rewards.shape[0],
+        critic_reward_layout=spec['layout'], critic_fitted_reward_basis=spec['fitted_reward_basis'],
+        actor_value_channels=list(spec['actor_channels']),
+        legacy_team_value_available=spec['legacy_value_available'],
         predicted_start_return_reward_units=prediction_start,
         realized_sampled_return_reward_units=mc_start,
+        episode_reward_basis='legacy_team_reward',
         episode_penalty=runner.last_reward_metrics['episode_penalty'],
         episode_generation_reward=runner.last_reward_metrics['episode_generation_reward'],
         episode_penalty_components={key:runner.last_reward_metrics['episode_penalty_'+key]
             for key in ('guaranteed_output','ecological_flow')},
-        episode_reward=mc_start,
-        discounted_episode_reward=mc_start,
+        episode_reward=accounting_reward,
+        discounted_episode_reward=accounting_reward,
         episode_energy_TWh=runner.last_rollout['episode_energy_TWh'],
         critic_update=parameter_update(runner.critic.critic, before['critic_parameters']),
-        critic_mc_pre=fit_metrics(before['mc'][..., -1:], before['prediction'][..., -1:]),
-        critic_mc_post=fit_metrics(before['mc'][..., -1:], prediction[..., -1:]),
-        critic_gae_post=fit_metrics(cb.returns[:-1, :, -1:], prediction[..., -1:]),
+        critic_mc_pre=fit_metrics(before['mc'][..., fitted], before['prediction'][..., fitted]),
+        critic_mc_post=fit_metrics(before['mc'][..., fitted], prediction[..., fitted]),
+        critic_gae_post=fit_metrics(cb.returns[:-1, :, fitted], prediction[..., fitted]),
         actors=[])
-    from harl.envs.cascade_reservoir.learning_signal import learning_signal_report
     result['learning_signal'] = learning_signal_report(runner, before, prediction)
     for i,(actor,buffer,old) in enumerate(zip(runner.actor, runner.actor_buffer,before['distributions'])):
         new = actor_distribution(actor,buffer)
@@ -179,6 +186,9 @@ def print_update_window(runner, window=10):
     active=[a for r in rows for a in r['actors'] if a['active_samples']]
     summary=dict(episode=runner.completed_episodes,update=runner.update_count,training_steps=runner.training_steps,
         window_updates=len(rows),window_episodes=sum(r.get('batch_episodes',1) for r in rows),gamma=rows[-1]['gamma'],
+        critic_reward_layout=rows[-1].get('critic_reward_layout', 'legacy_team'),
+        critic_fitted_reward_basis=rows[-1].get('critic_fitted_reward_basis', 'legacy_team_reward'),
+        legacy_team_value_available=rows[-1].get('legacy_team_value_available', True),
         window_starts=[year for r in rows for year in r['window_starts']],
         episode_horizon_days=rows[-1]['episode_horizon_days'],
         mc_rmse_pre=avg('critic_mc_pre','rmse'),mc_rmse_post=avg('critic_mc_post','rmse'),

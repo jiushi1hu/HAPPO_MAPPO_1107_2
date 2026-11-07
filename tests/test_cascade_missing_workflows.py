@@ -10,6 +10,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -25,6 +26,7 @@ from harl.envs.cascade_reservoir.periodic_evaluation import select_periodic_wind
 from harl.envs.cascade_reservoir.reward import (
     EpisodeRewardMetrics, OperationReward, reward_metadata, reward_settings)
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
+from harl.runners.on_policy_ha_runner import OnPolicyHARunner
 
 
 class GuaranteedOutputFrequencyRewardTest(unittest.TestCase):
@@ -128,6 +130,63 @@ class GuaranteedOutputFrequencyRewardTest(unittest.TestCase):
         self.assertAlmostEqual(fewer.learning_summary()['episode_mixed_rewards'][0]-
                                more.learning_summary()['episode_mixed_rewards'][0], 1.)
 
+    def test_shared_team_reward_counts_global_generation_once(self):
+        row = self.transition([90., 100., 100., 100., 0.], weight=2.)
+        # Own local rewards are (-2.01, .1, .1, .1, 0), with global=.078.
+        # This is one common team reward, not the sum of five mixed rewards.
+        self.assertAlmostEqual(row['system_reward'], -.816)
+        self.assertAlmostEqual(float(row['mixed_rewards'].sum()), -.660)
+        self.assertAlmostEqual(row['reward'], .053)
+        selected = CascadeReservoirRunner._critic_rewards(
+            SimpleNamespace(critic_reward_layout='shared_team'), [row])
+        self.assertEqual(selected.shape, (1, 1))
+        np.testing.assert_allclose(selected, [[-.816]], rtol=1e-7)
+
+
+class SharedTeamAdvantageTest(unittest.TestCase):
+    def test_team_advantage_is_normalized_once_and_shared_despite_own_masks(self):
+        for old_normalization_flag in (False, True):
+            with self.subTest(old_normalization_flag=old_normalization_flag):
+                runner = OnPolicyHARunner()
+                runner.num_agents, runner.fixed_order, runner.action_aggregation = 5, True, 'prod'
+                runner.algo_args = dict(train=dict(episode_length=4, n_rollout_threads=1),
+                    algo=dict(normalize_shared_advantages=old_normalization_flag,
+                              mask_inactive_factors=True))
+                raw = np.array([-3., -1., 1., 3.], dtype=np.float32).reshape(4, 1, 1)
+                runner.critic_buffer = SimpleNamespace(returns=np.concatenate((raw, np.zeros((1, 1, 1)))),
+                    value_preds=np.zeros((5, 1, 1), dtype=np.float32))
+                runner.value_normalizer = None
+                captured = []
+
+                class Buffer:
+                    def __init__(self, index):
+                        self.obs = np.zeros((5, 1, 2), dtype=np.float32)
+                        self.actions = np.zeros((4, 1, 1), dtype=np.float32)
+                        self.available_actions = None
+                        self.active_masks = np.ones((5, 1, 1), dtype=np.float32)
+                        self.active_masks[index % 4] = 0.
+                    def update_factor(self, factor):
+                        self.factor = factor.copy()
+
+                def train(buffer, advantages, state_type, **options):
+                    self.assertEqual(state_type, 'EP')
+                    self.assertTrue(options['advantages_normalized'])
+                    captured.append(advantages.copy())
+                    return {}
+
+                def evaluate(observations, *unused):
+                    return torch.zeros((len(observations), 1)), None, None
+
+                runner.actor_buffer = [Buffer(i) for i in range(5)]
+                runner.actor = [SimpleNamespace(train=train, evaluate_actions=evaluate) for _ in range(5)]
+                runner.critic = SimpleNamespace(train=mock.Mock(return_value={'value_loss': 0.}))
+                runner.train()
+                expected = raw/(np.sqrt(5.)+1e-5)
+                self.assertEqual(len(captured), 5)
+                for advantages in captured:
+                    np.testing.assert_allclose(advantages, expected, rtol=1e-7)
+                runner.critic.train.assert_called_once_with(runner.critic_buffer, None)
+
 
 class MissingWorkflowIntegrationTest(unittest.TestCase):
     @classmethod
@@ -182,6 +241,16 @@ class MissingWorkflowIntegrationTest(unittest.TestCase):
             initial = self.training_state(baseline)
             baseline.run(2)
             expected = self.training_state(baseline)
+            self.assertEqual(baseline.critic_reward_layout, 'shared_team')
+            self.assertEqual(baseline.critic_output_dim, 1)
+            self.assertEqual(baseline.actor_value_channels, (0,)*5)
+            self.assertEqual(baseline.critic_buffer.rewards.shape, (4, 2, 1))
+            self.assertEqual(tuple(baseline.value_normalizer.running_mean.shape), (1,))
+            for lane, episode in enumerate(baseline.episode_history):
+                selected_return = sum(self.args['algo']['gamma']**t*
+                                      baseline.critic_buffer.rewards[t, lane, 0] for t in range(4))
+                np.testing.assert_allclose(selected_return,
+                    episode['learning_rewards']['episode_system_reward'], rtol=1e-6)
             self.assertTrue(any(not torch.equal(initial['critic'][name], expected['critic'][name])
                                 for name in initial['critic']))
             self.assertTrue(any(not torch.equal(initial['actors'][i][name], expected['actors'][i][name])
@@ -217,7 +286,10 @@ class MissingWorkflowIntegrationTest(unittest.TestCase):
             for field in ('energy_MWh', 'episode_reward', 'episode_mixed_rewards',
                           'episode_system_reward', 'spill_volume_m3'):
                 np.testing.assert_allclose(replay[field], reference[field], rtol=0., atol=1e-10)
-            self.assertEqual(len(list(csv.DictReader(io.StringIO(output.getvalue())))), 4 * 5)
+            replay_rows = list(csv.DictReader(io.StringIO(output.getvalue())))
+            self.assertEqual(len(replay_rows), 4 * 5)
+            self.assertTrue(all(row['value_basis'] == 'shared_team_system_reward' for row in replay_rows))
+            self.assertTrue(all(row['legacy_team_value'] == '' for row in replay_rows))
 
     def test_cli_help_imports_complete_workflows(self):
         environment = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')

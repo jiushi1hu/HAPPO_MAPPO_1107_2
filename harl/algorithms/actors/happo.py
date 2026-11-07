@@ -168,7 +168,8 @@ class HAPPO(OnPolicyBase):
 
         return policy_loss, dist_entropy, actor_grad_norm, imp_weights
 
-    def train(self, actor_buffer, advantages, state_type, diagnostics=False):
+    def train(self, actor_buffer, advantages, state_type, diagnostics=False,
+              advantages_normalized=False):
         """Perform a training update using minibatch GD.
         Args:
             actor_buffer: (OnPolicyActorBuffer) buffer containing training data related to actor.
@@ -176,6 +177,8 @@ class HAPPO(OnPolicyBase):
             state_type: (str) type of state.
             diagnostics: (bool) measure fixed-batch objective endpoints without
                 changing optimizer steps or random states.
+            advantages_normalized: the runner has already normalized its common
+                team advantage once; do not normalize per-actor control rows.
         Returns:
             train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
                 ratio is the mean sampled-action ratio on positive-objective
@@ -199,7 +202,8 @@ class HAPPO(OnPolicyBase):
                 train_info.update(self.surrogate_changes(zero, zero))
             return dict(train_info, **budget_info)
 
-        if not self.args.get("normalize_shared_advantages", False):
+        if (not advantages_normalized and
+                not self.args.get("normalize_shared_advantages", False)):
             advantages_copy = advantages.copy()
             advantages_copy[actor_buffer.active_masks[:-1] == 0.0] = np.nan
             mean_advantages = np.nanmean(advantages_copy)

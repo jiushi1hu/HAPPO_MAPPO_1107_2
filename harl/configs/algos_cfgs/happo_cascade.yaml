@@ -43,7 +43,7 @@ algo:
   use_policy_active_masks: true
   action_aggregation: prod
   entropy_coef: 0.001
-  normalize_shared_advantages: true
+  normalize_shared_advantages: true  # MAPPO: per-reservoir normalization; HAPPO always normalizes its team advantage once.
   mask_inactive_factors: true
 experiment:
   collection_mode: five_year_parallel

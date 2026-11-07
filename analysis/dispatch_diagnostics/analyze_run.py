@@ -141,7 +141,11 @@ class DailyDispatchWriter:
                          'energy_MWh', 'local_reward', 'global_reward', 'mixed_reward',
                          'system_reward', 'legacy_team_reward', 'value', 'next_value', 'td_residual',
                          'realized_mixed_reward_to_go', 'legacy_team_value',
-                         'realized_legacy_team_reward_to_go'):
+                         'realized_legacy_team_reward_to_go', 'critic_reward_layout',
+                         'value_channel', 'value_basis', 'learning_reward',
+                         'realized_learning_reward_to_go', 'replay_gae_target', 'replay_gae_advantage',
+                         'shared_team_value', 'next_shared_team_value', 'shared_team_td_residual',
+                         'realized_shared_team_reward_to_go'):
                 row[name] = replay[name]
             row['discount_weight'] = float(self.policy.gamma**(replay['episode_step']-1))
             row['discounted_mixed_reward'] = row['discount_weight']*row['mixed_reward']
@@ -209,7 +213,9 @@ def analyze_saved_run(run_log, output_dir, seeds=None, report_python=None):
             raise ValueError('Checkpoint seed/update does not match the saved evaluation')
         manifest['checkpoints'].append(dict(seed=seed, path=str(checkpoint), sha256=file_hash(checkpoint),
             data_hashes=policy.metadata['data_hashes'], source_hashes=policy.metadata['source_hashes'],
-            settings_sha256=policy.metadata['settings_sha256']))
+            settings_sha256=policy.metadata['settings_sha256'],
+            critic_reward_layout=policy.critic_reward_layout, critic_output_dim=policy.critic_output_dim,
+            actor_value_channels=list(policy.actor_value_channels)))
         scenarios = [(window['window_id'], window['source_years'], window, True) for window in final['windows']]
         if seed in heldout:
             scenarios.append(('held_out_sequence', heldout[seed]['source_years'], heldout[seed], False))

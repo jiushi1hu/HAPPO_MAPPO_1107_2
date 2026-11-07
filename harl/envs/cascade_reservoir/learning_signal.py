@@ -2,6 +2,34 @@
 import numpy as np
 
 
+def critic_reward_spec(runner, channels):
+    """Resolve value semantics explicitly; retain old fixture-only fallbacks."""
+    agents = getattr(runner, 'num_agents', len(runner.actor))
+    layout = getattr(runner, 'critic_reward_layout', None)
+    if layout is None:
+        layout = 'legacy_team' if channels == 1 else 'mixed_by_reservoir_then_legacy_team'
+    if layout == 'shared_team' and channels == 1:
+        mapping = (0,)*agents
+        sources, bases = ('system_reward',)*agents, ('shared_team_return',)*agents
+        fitted_basis, legacy_available = 'system_reward', False
+    elif layout == 'mixed_by_reservoir_then_legacy_team' and channels == agents+1:
+        mapping = tuple(range(agents))
+        sources = tuple('mixed_rewards[{}]'.format(i) for i in range(agents))
+        bases = ('own_mixed_return',)*agents
+        fitted_basis, legacy_available = 'legacy_team_reward', True
+    elif layout == 'legacy_team' and channels == 1:
+        mapping = (0,)*agents
+        sources, bases = ('reward',)*agents, ('legacy_team_return',)*agents
+        fitted_basis, legacy_available = 'legacy_team_reward', True
+    else:
+        raise ValueError('Critic reward layout disagrees with its output channels')
+    if tuple(getattr(runner, 'actor_value_channels', mapping)) != mapping:
+        raise ValueError('Actor value channels disagree with the critic reward layout')
+    return dict(layout=layout, shared_team=layout == 'shared_team', actor_channels=mapping,
+        actor_reward_sources=sources, actor_value_bases=bases, fit_channel=channels-1,
+        fitted_reward_basis=fitted_basis, legacy_value_available=legacy_available)
+
+
 def signal_statistics(values):
     """Describe spread, without treating correlated daily rows as replicates."""
     values = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -42,6 +70,7 @@ def learning_signal_report(runner, before, post_prediction):
     if (len(shape) != 3 or shape[0] < 1 or shape[1] < 1 or
             shape[2] not in (1, runner.num_agents+1)):
         raise ValueError('Learning-signal diagnostics require complete cascade trajectories')
+    spec = critic_reward_spec(runner, shape[2])
     signals = (before['mc'], before['prediction'], before['gae_targets'], post_prediction)
     for value in signals:
         if np.shape(value) != shape:
@@ -71,7 +100,7 @@ def learning_signal_report(runner, before, post_prediction):
     # Match the actual float32 training arithmetic before making float64 summaries.
     raw_advantage = targets-old_prediction
     mc_advantage = mc-old_prediction
-    shared = runner.algo_args['algo'].get('normalize_shared_advantages', False)
+    shared = spec['shared_team'] or runner.algo_args['algo'].get('normalize_shared_advantages', False)
     normalized_advantage = ((raw_advantage-raw_advantage.mean(axis=(0, 1), keepdims=True))/
                             (raw_advantage.std(axis=(0, 1), keepdims=True)+1e-5)
                             if shared else None)
@@ -93,7 +122,7 @@ def learning_signal_report(runner, before, post_prediction):
         # train() exits before optimization for an entirely forced actor.
         if not active.any():
             objective = np.zeros_like(objective)
-        channel = 0 if shape[2] == 1 else i
+        channel = spec['actor_channels'][i]
         own = slice(channel, channel+1)
         actor_raw = raw_advantage[..., own]
         actor_mc_advantage = mc_advantage[..., own]
@@ -109,6 +138,8 @@ def learning_signal_report(runner, before, post_prediction):
         comparison = _advantage_comparison(actor_raw[objective], actor_mc_advantage[objective])
         weight_sum = float(weights[objective].sum(dtype=np.float64))
         actors.append(dict(agent=i, value_channel=channel,
+            learning_reward_source=spec['actor_reward_sources'][i],
+            value_basis=spec['actor_value_bases'][i],
             reward=signal_statistics(cb.rewards[..., own]),
             pre_value=signal_statistics(old_prediction[..., own]),
             post_value=signal_statistics(post_prediction[..., own]),
@@ -116,26 +147,31 @@ def learning_signal_report(runner, before, post_prediction):
             critic_mc_pre=_fit(mc[..., own], old_prediction[..., own]),
             critic_mc_post=_fit(mc[..., own], post_prediction[..., own]),
             controllable_rows=int(active.sum()), objective_rows=int(objective.sum()),
-            normalization_scope='own_channel_common_rows' if shared else 'actor_controllable_rows',
+            normalization_scope=('shared_team_common_rows' if spec['shared_team'] else
+                                 'own_channel_common_rows' if shared else 'actor_controllable_rows'),
             raw_advantage=comparison['gae'], training_advantage=signal_statistics(training_advantage[objective]),
             gae_mc_sign_disagreement_fraction=comparison['sign_disagreement_fraction'],
             nonzero_comparison_count=comparison['nonzero_comparison_count'], objective_weight_sum=weight_sum,
             weighted_training_advantage_mean=(float(np.sum(
                 weights[objective].astype(np.float64)*training_advantage[objective])/weight_sum)
                 if weight_sum > 0. else None)))
-    # Existing episode and aggregate fits continue to describe the legacy team
-    # return; the actor entries above describe the actual mixed-reward learning.
-    legacy = slice(shape[2]-1, shape[2])
+    # Fit the reward this head actually predicts. A scalar shared-team head is
+    # never interpreted as an unavailable legacy-team value function.
+    fitted = slice(spec['fit_channel'], spec['fit_channel']+1)
     per_episode = []
     for lane, (window, start, end) in enumerate(zip(windows, starts, ends)):
-        rows = (slice(start, end), slice(lane, lane+1), legacy)
-        per_episode.append(dict(window_start_year=int(window), source_years=list(source_years[lane]),
-            episode_days=int(end-start), episode_reward=float(mc[start, lane, -1]),
+        rows = (slice(start, end), slice(lane, lane+1), fitted)
+        entry = dict(window_start_year=int(window), source_years=list(source_years[lane]),
+            episode_days=int(end-start), critic_fitted_reward_basis=spec['fitted_reward_basis'],
+            realized_fitted_return_reward_units=float(mc[start, lane, spec['fit_channel']]),
             gae_start_target=float(targets[start, lane, -1]), pre_value_start=float(old_prediction[start, lane, -1]),
             critic_mc_pre=_fit(mc[rows], old_prediction[rows]),
             critic_mc_post=_fit(mc[rows], post_prediction[rows]),
             gae_target_vs_mc=_fit(mc[rows], targets[rows]),
-            advantages=_advantage_comparison(raw_advantage[rows], mc_advantage[rows])))
+            advantages=_advantage_comparison(raw_advantage[rows], mc_advantage[rows]))
+        if not spec['shared_team']:
+            entry['episode_reward'] = float(mc[start, lane, spec['fit_channel']])
+        per_episode.append(entry)
     unique, counts = np.unique(np.asarray(windows, dtype=int), return_counts=True)
     frequencies = counts.astype(np.float64)/len(windows)
     use_gae = bool(getattr(cb, 'use_gae', runner.algo_args['algo'].get('use_gae', True)))
@@ -152,7 +188,9 @@ def learning_signal_report(runner, before, post_prediction):
             diversity_definition='inverse concentration of sampled-window frequencies; not statistical sample size',
             episode_lengths=lengths, trajectory_return_statistics=signal_statistics(
                 [mc[start, lane, -1] for lane, start in enumerate(starts)])),
-        critic_output_layout='mixed_by_reservoir_then_legacy_team' if shape[2] > 1 else 'legacy_team',
-        gae_target_vs_mc=_fit(mc[..., legacy], targets[..., legacy]),
-        advantages=_advantage_comparison(raw_advantage[..., legacy], mc_advantage[..., legacy]),
+        critic_output_layout=spec['layout'], critic_fitted_reward_basis=spec['fitted_reward_basis'],
+        actor_value_channels=list(spec['actor_channels']),
+        legacy_team_value_available=spec['legacy_value_available'],
+        gae_target_vs_mc=_fit(mc[..., fitted], targets[..., fitted]),
+        advantages=_advantage_comparison(raw_advantage[..., fitted], mc_advantage[..., fitted]),
         actors=actors, per_episode=per_episode)

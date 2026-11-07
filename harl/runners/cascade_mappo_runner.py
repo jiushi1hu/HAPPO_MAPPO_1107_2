@@ -13,6 +13,8 @@ class CascadeMAPPORunner(CascadeReservoirRunner):
     actor_class = MAPPO
     algorithm_name = 'mappo'
     share_actor_parameters = True
+    critic_reward_layout = 'mixed_by_reservoir_then_legacy_team'
+    actor_value_channels = (0, 1, 2, 3, 4)
 
     def __init__(self, data, physical_config, algo_args, seed, *args, **kwargs):
         requested_args = copy.deepcopy(algo_args)

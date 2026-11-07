@@ -5,12 +5,16 @@ PKU-MARL HARL. HAPPO uses five independent categorical actors; MAPPO uses one
 identity-conditioned actor shared by all five reservoir agents. Both use one
 centralized critic.
 The environment resolves releases upstream to downstream with zero travel delay.
-Each actor learns from its own 50/50 local/global reward. The original team
-reward remains available for evaluation, daily CSVs and historical plots.
+HAPPO learns one shared team advantage from `0.5 * sum(local rewards) +
+0.5 * global generation reward`, counting the global term once. MAPPO retains
+its individual 50/50 local/global advantages. The legacy team reward remains
+available for evaluation, daily CSVs and historical plots.
 
 The comparison entry point runs shared-actor MAPPO on the same
-physical environment and reward channels. The existing HAPPO actor and
-sequential-update implementation are retained.
+physical environment. HAPPO retains five independent actors and sequential
+likelihood corrections; MAPPO retains its shared actor and individual advantages.
+Their learning objectives now differ, so the figures compare these configured
+methods rather than isolating an algorithm-only effect.
 
 ## Run HAPPO and MAPPO with three comparison figures
 
@@ -80,11 +84,12 @@ five-component one-hot reservoir identity to its local observation, so the share
 network can distinguish reservoirs with different physical characteristics.
 With daily limits enabled, physical observations and buffers remain 15-dimensional,
 MAPPO's actor input is 20-dimensional, and HAPPO's actor input remains 15-dimensional.
-The centralized critic still receives 38 system features and produces six values.
-The physical model, observations supplied by the environment, rewards and service
-thresholds have not changed. Both algorithms use the existing hidden widths `[64, 128, 256, 256]`,
-ReLU/LayerNorm layers, 100-command categorical distributions, a centralized
-six-output critic, ValueNorm, individual 50/50 local/global rewards, GAE, forced
+Both centralized critics receive 38 system features. HAPPO has one scalar team
+value output; MAPPO retains five mixed-return outputs and one legacy-return
+output. The physical model, environment observations, local/global reward
+components and service thresholds have not changed. Both algorithms use the
+existing hidden widths `[64, 128, 256, 256]`, ReLU/LayerNorm layers, 100-command
+categorical distributions, ValueNorm, GAE, forced
 action masks, and uniform Actor row weighting. The shared YAML remains
 `harl/configs/algos_cfgs/happo_cascade.yaml`. Its `share_param: false` continues to
 describe HAPPO; the MAPPO runner and comparison launcher explicitly enable sharing
@@ -107,14 +112,17 @@ clipping. With `--diagnostics`, KL divergence is measured after updates for
 reporting; it does not stop epochs or reject optimizer steps.
 
 This is a task-adapted, parameter-sharing MAPPO comparison. HARL's generic
-EP default uses a common scalar reward/value; this task retains its existing
-individual mixed rewards and six value outputs for both algorithms. It also
+EP default uses a common scalar reward/value. HAPPO now uses one team reward,
+one scalar team value, and one advantage normalized once across the common
+rollout rows and shared by all five actors. MAPPO retains individual mixed
+rewards and six value outputs. This task also
 retains this repository's full-row loss averaging, rather than introducing the
 reference's active-count normalization. Actor policy and entropy losses have no
 additional episode-age discount multiplier. Therefore,
 the comparison now includes both the update-rule difference and policy parameter
-sharing under the existing reservoir formulation. It does not isolate the
-sequential-correction effect alone or reproduce every generic HARL default.
+sharing and the explicitly requested learning-objective difference. It does not
+isolate the sequential-correction effect alone or reproduce every generic HARL
+default. Each figure identifies the different learning objectives.
 
 MAPPO checkpoints record their algorithm identity, sharing flag and reservoir IDs,
 and save one actor state. Loading reconstructs one frozen shared network with five
@@ -303,8 +311,15 @@ rates, energy and final storage across configurations; returns with different
 gamma values cannot be compared directly. A separate lambda experiment can use
 `--gae-lambda 1`; it is not the default.
 
-Actors optimize the sequential HAPPO clipped policy surrogate with entropy
-regularization, using their own mixed-return advantages from actual trajectories.
+HAPPO actors optimize the sequential clipped policy surrogate with entropy
+regularization, using the same normalized team advantage from actual trajectories.
+The team reward is `0.5 * sum(local rewards) + 0.5 * global generation reward`.
+It is the existing `system_reward`, not the sum of five mixed rewards: summing
+those mixed rewards would count the global term five times. GAE uses the scalar
+team value, gamma 0.995 and lambda 0.95. The raw team advantage is normalized
+once over all common rollout rows before the sequential actor loop, and each
+actor receives an identical copy. Its own controllability mask and HAPPO factor
+are applied afterward in the loss. No per-actor re-normalization is performed.
 The model-assisted command imitation objective and its candidate-cost data flow
 have been removed. Service requirements influence learning through the reward;
 there is no preferred-command target or additional physics-derived actor loss.
@@ -321,17 +336,20 @@ the critic receives 38 centralized state values:
 
 ```text
 Each actor: 15 -> 64 -> 128 -> 256 -> 256 -> 100 categorical logits
-Critic:     38 -> 64 -> 128 -> 256 -> 256 -> 6 values
+HAPPO critic: 38 -> 64 -> 128 -> 256 -> 256 -> 1 team value
+MAPPO critic: 38 -> 64 -> 128 -> 256 -> 256 -> 6 values
 ```
 
 Each network has separate weights. Hidden layers use
 `Linear -> ReLU -> LayerNorm`; logits and the final value remain linear.
-The critic is one shared network. Outputs 0--4 estimate WDD/BHT/XLD/XJB/THR
-mixed returns; output 5 estimates the legacy team return for existing diagnostics.
-ValueNorm tracks each output separately. GAE uses the matching reward and value
-channel; actor i receives only its own advantage column. The existing
-`normalize_shared_advantages` setting now normalizes each actor's channel over
-the common rollout rows independently, before controllability masks.
+HAPPO uses one centralized network and one ValueNorm channel for the team
+return. All five actors use value channel 0 and the same once-normalized GAE,
+including when `normalize_shared_advantages` is false. MAPPO retains one
+centralized network whose outputs 0--4 estimate WDD/BHT/XLD/XJB/THR mixed
+returns and output 5 estimates the legacy team return. MAPPO ValueNorm tracks
+each output separately, and its existing normalization flag retains its prior
+per-reservoir behavior. The diagnostic team value and GAE fields identify
+their reward basis explicitly; HAPPO no longer trains a legacy value head.
 `--no-daily-level-limits` selects global operating bounds only, with input
 dimensions 11/18.
 
@@ -650,8 +668,7 @@ u = k / (K - 1)
 release = feasible_low + u^2 * (feasible_high - feasible_low)
 ```
 
-Each actor's learning reward uses the paper's local/global mixing structure,
-with alpha fixed at 0.5:
+Local and global reward components use a mixing coefficient of 0.5:
 
 ```text
 local_i = power_i / installed_capacity_i
@@ -675,15 +692,16 @@ System accounting includes the global term once and is not the sum of mixed
 rewards. Episode JSONL records include discounted per-reservoir local/mixed
 totals and system/global totals; periodic and final evaluations report them too.
 
-The five centralized value outputs are an implementation choice for estimating
-the five learning returns, not five independent critics or a critic organization
-explicitly prescribed by the paper. The sixth output preserves legacy team
-critic-fit diagnostics. HAPPO's command ratios, scalar sequential factors,
-clipping, update order and control masks are retained. The unchanged importance
-factor reweights preceding actors' action distributions for each actor's own
-surrogate. Since these rewards define individual objectives, the common-return
-HAPPO improvement guarantee is not asserted for the system-accounting metric;
-an individual reward increase need not increase that metric.
+HAPPO uses `system` as its common learning reward. One centralized scalar
+value output estimates this team return. Its GAE is normalized once over common
+rollout rows and shared by all five actors. The global component enters `system`
+only once. HAPPO's command ratios, scalar sequential factors, clipping, update
+order and control masks are retained; each actor uses the same team advantage
+with its sequential importance factor. These approximate clipped updates do
+not establish a monotonic improvement guarantee for measured scheduling results.
+MAPPO retains `mixed_i` as each reservoir's learning reward, with five centralized
+mixed-return value outputs and a sixth legacy-return output for accounting
+diagnostics. These are outputs of one network, not six independent critics.
 
 The preserved daily team reward is normalized generation minus mean relative guaranteed-output
 and ecological-flow deficits, each with weight 1. Generation is normalized by
@@ -691,8 +709,8 @@ and ecological-flow deficits, each with weight 1. Generation is normalized by
 `reservoir_service_requirements.csv`. `--no-reward-penalties` selects a separate
 generation-only objective.
 
-Gamma applies consistently to return estimation, actor time weights and episode
-reward accounting. Physical violation counts, deficit volumes and deficit
+Gamma applies to return estimation and episode reward accounting. Actor loss
+rows have uniform temporal weight. Physical violation counts, deficit volumes and deficit
 energy remain undiscounted. Episode generation and return are totals over the
 whole horizon. Soft costs express a tradeoff; hard feasibility does not imply
 zero service shortfalls.
@@ -700,14 +718,15 @@ zero service shortfalls.
 ## Daily water-value diagnostics and saved-policy replay
 
 `--trajectory-diagnostics` links all five reservoirs' physical decisions to the
-actual mixed-reward training signals. It implies `--diagnostics` and requires a
+actual learning signals: shared team signals for HAPPO and individual mixed
+signals for MAPPO. It implies `--diagnostics` and requires a
 new `--episode-log`. A separate `<stem>_seedN_trajectory.csv` contains one row
 per training day, lane and reservoir. Existing team metrics and XLD evaluation
 diagnostics keep their definitions and output files.
 
 Each row records start/end storage and levels, physical inflow/release/turbine
 flow/spill/head/power, feasible release bounds, sampled and effective commands,
-local/global/mixed rewards, service deficits, frozen own current/next values,
+local/global/mixed rewards, service deficits, frozen current/next values with explicit reward basis,
 TD residual, GAE target, raw and normalized advantage, realized reward-to-go,
 action probability, entropy, objective weight and the exact HAPPO factor at
 that actor's sequential update entry. Values are frozen before optimization
@@ -744,7 +763,8 @@ PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python -B examples/train_
 `--checkpoint-interval N` to also save every N completed updates; its default
 0 saves only the final update. Files and existing checkpoint directories are
 never overwritten. Checkpoints contain all five actors, the single centralized
-six-output critic, ValueNorm, effective settings and source/data hashes. They
+critic (one team output for HAPPO, six outputs for MAPPO), ValueNorm, effective
+settings and source/data hashes. They
 support evaluation replay, not training resume.
 
 Replay a saved policy on an ordered training-only or held-out-only source
@@ -761,8 +781,10 @@ Repeat with a new output path and `--override-action 1 BHT 16` to replace just
 the first BHT command. Later commands follow the same saved policy as it reacts
 to the changed state. The summary reports energy, service deficits, all five
 learning returns, system return, spill and final storage. The five-row-per-day
-CSV links physical dispatch to saved values and realized mixed reward-to-go;
-it does not reconstruct training advantages. Comparing baseline and deviation
+CSV links physical dispatch to saved values and the corresponding realized
+learning reward-to-go, with explicit reward layout and value-basis fields.
+It also reports GAE recomputed on the replay trajectory; this does not
+reconstruct the original training advantages. Comparing baseline and deviation
 under the same forcing measures that particular intervention, not optimality.
 
 Replay requires the saved episode horizon, preserving the policy's remaining

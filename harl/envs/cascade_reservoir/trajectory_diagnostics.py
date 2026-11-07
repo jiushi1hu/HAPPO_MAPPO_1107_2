@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from harl.envs.cascade_reservoir.data_loader import IDS
+from harl.envs.cascade_reservoir.learning_signal import critic_reward_spec
 
 
 _PHYSICAL_COLUMNS = {
@@ -45,14 +46,16 @@ TRAJECTORY_DIAGNOSTIC_FIELDS = (
     'legacy_generation_reward', 'sampled_action_index', 'effective_action_index',
     'action_bins', 'forced_action', 'sampled_action_probability',
     'sampled_action_log_probability', 'effective_action_probability',
-    'effective_action_log_probability', 'entropy', 'own_reward_for_learning',
+    'effective_action_log_probability', 'entropy', 'learning_reward',
+    'learning_reward_source', 'value_basis', 'critic_reward_layout', 'own_reward_for_learning',
     'own_value_frozen', 'own_next_value_frozen', 'next_state_mask', 'td_residual',
     'gae_target', 'raw_advantage', 'normalized_advantage', 'realized_reward_to_go',
     'episode_time_weight', 'policy_objective_weight', 'happo_factor',
 )
 _OPTIONAL_COLUMNS = set(_SERVICE_COLUMNS)
-_TEXT_COLUMNS = {'date', 'reservoir_id', 'source_years'}
-_SUMMARY_FIELDS = ('local_reward', 'mixed_reward', 'own_value_frozen', 'td_residual',
+_TEXT_COLUMNS = {'date', 'reservoir_id', 'source_years',
+                 'learning_reward_source', 'value_basis', 'critic_reward_layout'}
+_SUMMARY_FIELDS = ('local_reward', 'mixed_reward', 'learning_reward', 'own_value_frozen', 'td_residual',
                    'raw_advantage', 'normalized_advantage', 'realized_reward_to_go')
 
 
@@ -125,6 +128,8 @@ class TrajectoryDiagnosticsWriter:
     placeholders, not policy likelihoods. Their objective weight is zero.
     The retained episode_time_weight column is always 1.0: actor rows have no
     outer discount multiplier. Policy active masks and HAPPO factors are separate.
+    The own_* columns identify the target associated with the actor row; they
+    all reference the same team value/return when critic_reward_layout is shared_team.
     """
 
     def __init__(self, path):
@@ -229,6 +234,7 @@ class TrajectoryDiagnosticsWriter:
                 lanes != len(self._batch['episode_ids']) or len(runner.actor_buffer) != len(IDS) or
                 len(runner.actor) != len(IDS)):
             raise ValueError('Trajectory captures must match a complete five-reservoir rollout')
+        spec = critic_reward_spec(runner, channels)
         rewards = _array(cb.rewards, shape, 'learning rewards')
         frozen = {key:_array(before[key], shape, key) for key in
                   ('prediction', 'next_prediction', 'gae_targets', 'mc')}
@@ -240,7 +246,7 @@ class TrajectoryDiagnosticsWriter:
         if not 0. <= gamma <= 1.:
             raise ValueError('gamma must be between zero and one')
         raw = frozen['gae_targets']-frozen['prediction']
-        shared = runner.algo_args['algo'].get('normalize_shared_advantages', False)
+        shared = spec['shared_team'] or runner.algo_args['algo'].get('normalize_shared_advantages', False)
         common = ((raw-raw.mean(axis=(0, 1), keepdims=True))/
                   (raw.std(axis=(0, 1), keepdims=True)+1e-5) if shared else None)
         if len(before['distributions']) != len(IDS):
@@ -251,7 +257,7 @@ class TrajectoryDiagnosticsWriter:
             active = _array(buffer.active_masks[:-1], (days, lanes, 1), 'active masks')
             if not np.isin(active, (0., 1.)).all() or not np.array_equal(buffer.masks, masks):
                 raise ValueError('Actor masks must match complete rollout boundaries')
-            channel = 0 if channels == 1 else i
+            channel = spec['actor_channels'][i]
             advantage = raw[..., channel:channel+1]
             if shared:
                 normalized = common[..., channel:channel+1]
@@ -281,6 +287,9 @@ class TrajectoryDiagnosticsWriter:
             _array(logits, probabilities.shape, 'frozen action logs')
             _array(entropy, (days, lanes), 'frozen action entropy')
             actors.append(dict(channel=channel, raw=advantage, normalized=normalized,
+                learning_reward_source=spec['actor_reward_sources'][i],
+                value_basis=spec['actor_value_bases'][i],
+                critic_reward_layout=spec['layout'],
                 time=time, weights=weights, factor=factor, actions=actions, logs=logs,
                 probabilities=probabilities, logits=logits, entropy=entropy, active=active))
         return rewards, frozen, masks, gamma, actors
@@ -291,6 +300,12 @@ class TrajectoryDiagnosticsWriter:
         if self._batch is None or not self._transitions or before is None:
             raise ValueError('A captured batch and frozen before-update diagnostics are required')
         rewards, frozen, masks, gamma, actors = self._learning_arrays(runner, before, factors)
+        spec = critic_reward_spec(runner, rewards.shape[-1])
+        if spec['shared_team']:
+            captured_team = np.asarray([[row['system_reward'] for row in transitions]
+                                        for transitions in self._transitions], dtype=np.float32)
+            if not np.array_equal(rewards[..., 0].astype(np.float32), captured_team):
+                raise ValueError('Shared-team learning rewards disagree with captured system_reward')
         windows = {name:{reservoir:_Summary() for reservoir in IDS}
                    for name in ('all_days', 'first_14_days', 'october_may')}
         batch = self._batch
@@ -326,7 +341,10 @@ class TrajectoryDiagnosticsWriter:
                         sampled_action_log_probability=float(actor['logits'][t,lane,sampled]),
                         effective_action_log_probability=float(actor['logs'][t,lane,0]),
                         effective_action_probability=float(np.exp(actor['logs'][t,lane,0])),
-                        entropy=float(actor['entropy'][t,lane]), own_reward_for_learning=float(rewards[t,lane,channel]),
+                        entropy=float(actor['entropy'][t,lane]), learning_reward=float(rewards[t,lane,channel]),
+                        learning_reward_source=actor['learning_reward_source'], value_basis=actor['value_basis'],
+                        critic_reward_layout=actor['critic_reward_layout'],
+                        own_reward_for_learning=float(rewards[t,lane,channel]),
                         own_value_frozen=float(frozen['prediction'][t,lane,channel]),
                         own_next_value_frozen=float(frozen['next_prediction'][t,lane,channel]),
                         next_state_mask=float(masks[t+1,lane,0]),
@@ -356,14 +374,18 @@ class TrajectoryDiagnosticsWriter:
                         windows['october_may'][reservoir].update(row, transition['timestep_seconds'])
         self.stream.flush()
         self.rows_written += count
-        summary = dict(schema='cascade_trajectory_v1', file=str(self.path.resolve()), rows=count,
+        summary = dict(schema='cascade_trajectory_v2', file=str(self.path.resolve()), rows=count,
             total_rows_written=self.rows_written, episode_horizon_days=len(self._transitions),
             parallel_environments=len(batch['episode_ids']), gamma=gamma,
+            critic_reward_layout=spec['layout'], critic_fitted_reward_basis=spec['fitted_reward_basis'],
+            actor_value_channels=list(spec['actor_channels']),
+            legacy_team_value_available=spec['legacy_value_available'],
             actor_temporal_weighting='uniform_rollout_rows',
             actor_objective_reduction='mean over all rollout rows; policy active masks zero forced rows',
             episode_time_weight='always 1.0; column retained for CSV compatibility',
             policy_objective_weight='policy active mask only; HAPPO likelihood factor is recorded separately',
             value_source='before_update snapshot in reward units before optimization and ValueNorm changes',
+            own_column_interpretation='actor-associated learning target; shared_team rows repeat one common team value and return',
             probability_source='before_update collection distribution; forced effective probability/log-probability are 1/0 placeholders',
             repeated_accounting_scalars=['global_reward', 'system_reward', 'legacy_team_reward', 'legacy_generation_reward'],
             interpretation='observational correlated training rows; realized reward-to-go is not expected value; '
